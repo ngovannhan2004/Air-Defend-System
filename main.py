@@ -14,7 +14,7 @@ app = Flask(__name__)
 # ==============================================================================
 class SerialManager:
     def __init__(self, port="COM5", baudrate=115200):
-        self.distance = 0
+        self.distance = 8190  # Mặc định ban đầu ở trạng thái xa vô tận
         self.motion = 0
         try:
             self.ser = serial.Serial(port, baudrate, timeout=0.1)
@@ -91,13 +91,13 @@ model = YOLO("best.pt")
 tracker = PanTiltTracker()
 serial_mgr = SerialManager(port="COM5", baudrate=115200)
 
-# Khởi tạo Camera (Thiết lập index 1 theo cấu hình của bạn)
+# Khởi tạo Camera (Thiết lập index 1 theo cấu hình phần cứng của bạn)
 cap = cv2.VideoCapture(1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 class_names = {0: "Helicopter", 1: "Jet", 2: "Rocket"}
-system_state = {"distance": 274, "status": "IDLE", "pan": 90, "tilt": 90, "label": "-", "log_msg": "", "is_alarm": False}
+system_state = {"distance": 8190, "status": "IDLE", "pan": 90, "tilt": 90, "label": "-", "log_msg": "", "is_alarm": False}
 
 def generate_frames():
     global system_state
@@ -108,48 +108,60 @@ def generate_frames():
             continue
 
         frame = cv2.resize(frame, (960, 540))
-        distance = serial_mgr.distance if (serial_mgr and serial_mgr.ser) else 274
+        
+        # Lấy dữ liệu cảm biến thời gian thực từ ESP32 gửi lên
+        distance = serial_mgr.distance if (serial_mgr and serial_mgr.ser) else 8190
+        motion = serial_mgr.motion if (serial_mgr and serial_mgr.ser) else 0
 
         status = "IDLE"
         label = "-"
         pan, tilt = tracker.pan, tracker.tilt
         target_found = False
 
-        # Nhận diện vật thể bằng YOLO
-        results = model(frame, conf=0.45, verbose=False)
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                label = class_names.get(int(box.cls), "Target")
-                
-                target_found = True
-                status = "TRACKING"
-                pan, tilt = tracker.update(cx, cy, 960, 540)
-                
-                # Gửi tọa độ góc xuống ESP32 liên tục khi đang bám mục tiêu
-                serial_mgr.send_servo(pan, tilt)
+        # ==============================================================================
+        # 🚨 ĐOẠN ĐIỀU KIỆN KIỂM TRA KHOẢNG CÁCH 8000mm HOẶC CÓ CHUYỂN ĐỘNG
+        # ==============================================================================
+        if distance <= 8000 or motion == 1:
+            status = "SCANNING"  # Vật thể ở phạm vi kích hoạt, bật trạng thái Quét YOLO
+            
+            results = model(frame, conf=0.45, verbose=False)
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    label = class_names.get(int(box.cls), "Target")
+                    
+                    target_found = True
+                    status = "TRACKING"
+                    pan, tilt = tracker.update(cx, cy, 960, 540)
+                    
+                    # Gửi tọa độ góc xuống ESP32 liên tục khi đang bám mục tiêu
+                    serial_mgr.send_servo(pan, tilt)
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
-                break
-            if target_found: break
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
+                    break
+                if target_found: break
+        else:
+            status = "OUT OF RANGE"  # Mục tiêu ở quá xa, tắt YOLO để giảm tải cho CPU
 
-        # Nếu không tìm thấy mục tiêu, vẫn gửi góc hiện tại xuống để giữ nguyên hoặc quét tự động
+        # Nếu không tìm thấy mục tiêu (Dù đang quét hoặc ngoài phạm vi), vẫn duy trì cập nhật góc hiện tại
         if not target_found:
             serial_mgr.send_servo(pan, tilt)
 
         current_time = time.strftime("%H:%M:%S", time.localtime())
         is_alarm = False
 
-        # 🚨 KIỂM TRA ĐIỀU KIỆN BIÊN ĐỂ HIỂN THỊ TEXT CẢNH BÁO LÊN WEB
+        # Kiểm tra điều kiện biên để đưa cảnh báo lên giao diện Web Monitor
         if int(pan) > 180 or int(pan) <= 0:
             log_msg = f"[{current_time}] ⚠️ [CẢNH BÁO NGUY HIỂM] Máy Bay Vào Không Phận! (Góc hiện tại: {int(pan)}°)"
             is_alarm = True
         elif status == "TRACKING":
             log_msg = f"[{current_time}] [CẢNH BÁO] Phát hiện mục tiêu! Khoảng cách: {distance}mm. X={int(pan)}°, Y={int(tilt)}°"
+        elif status == "SCANNING":
+            log_msg = f"[{current_time}] [HỆ THỐNG] Vật thể xuất hiện trong tầm ({distance}mm)! Đang chạy phân tích thực thể..."
         else:
-            log_msg = f"[{current_time}] [HỆ THỐNG] Đang quét dải tần tự động... Không phát hiện mục tiêu."
+            log_msg = f"[{current_time}] [HỆ THỐNG] An toàn. Không phát hiện vật thể xâm nhập gần (Khoảng cách hiện tại: {distance}mm)."
 
         system_state = {
             "distance": int(distance),
@@ -220,7 +232,7 @@ HTML_LAYOUT = """
         </div>
         <div class="radar-right-panel">
             <div class="panel-box">
-                <div class="panel-header">RADAR MICRO-WAVE SCANNER (RCWL-0516)</div>
+                <div class="panel-header">RADAR MICRO-WAVE SCANNER</div>
                 <div class="radar-center-wrapper"><canvas id="radar" width="240" height="240"></canvas></div>
             </div>
             <div class="bottom-dashboard">
@@ -229,8 +241,8 @@ HTML_LAYOUT = """
                     <div class="card-data" id="lbl-distance">0<span>mm</span></div>
                 </div>
                 <div class="telemetry-card">
-                    <div class="card-label">TRẠNG THÁI RADAR</div>
-                    <div class="card-data" id="lbl-status" style="color: #ffaa00; font-size:16px;">QUÉT TÌM KIẾM</div>
+                    <div class="card-label">TRẠNG THÁI HỆ THỐNG</div>
+                    <div class="card-data" id="lbl-status" style="color: #ffaa00; font-size:16px;">TÌM KIẾM</div>
                 </div>
                 <div class="telemetry-card">
                     <div class="card-label">SERVO PAN</div>
@@ -249,13 +261,13 @@ HTML_LAYOUT = """
         const canvas = document.getElementById("radar");
         const ctx = canvas.getContext("2d");
         const cx = canvas.width / 2; const cy = canvas.height / 2; const maxR = canvas.width / 2 - 15;
-        let curPan = 90; let curDist = 274;
+        let curPan = 90; let curDist = 8190;
 
         function draw() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.strokeStyle = "rgba(0, 240, 255, 0.15)"; ctx.lineWidth = 1;
-            ctx.beginPath(); ctx.arc(cx, cy, maxR * (100/600), 0, 2*Math.PI); ctx.stroke();
-            ctx.beginPath(); ctx.arc(cx, cy, maxR * (300/600), 0, 2*Math.PI); ctx.stroke();
+            ctx.beginPath(); ctx.arc(cx, cy, maxR * (2000/8000), 0, 2*Math.PI); ctx.stroke();
+            ctx.beginPath(); ctx.arc(cx, cy, maxR * (5000/8000), 0, 2*Math.PI); ctx.stroke();
             ctx.beginPath(); ctx.arc(cx, cy, maxR, 0, 2*Math.PI); ctx.stroke();
             ctx.beginPath(); ctx.moveTo(cx - maxR, cy); ctx.lineTo(cx + maxR, cy); ctx.stroke();
             ctx.beginPath(); ctx.moveTo(cx, cy - maxR); ctx.lineTo(cx, cy + maxR); ctx.stroke();
@@ -264,8 +276,8 @@ HTML_LAYOUT = """
             ctx.strokeStyle = "rgba(0, 240, 255, 0.6)"; ctx.lineWidth = 1.5;
             ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + maxR * Math.cos(angleRad), cy - maxR * Math.sin(angleRad)); ctx.stroke();
 
-            if (curDist > 0 && curDist <= 600) {
-                let rPixel = maxR * (curDist / 600);
+            if (curDist > 0 && curDist <= 8000) {
+                let rPixel = maxR * (curDist / 8000);
                 let targetX = cx + rPixel * Math.cos(angleRad); let targetY = cy - rPixel * Math.sin(angleRad);
                 ctx.fillStyle = "#ff0000"; ctx.shadowBlur = 15; ctx.shadowColor = "#ff0000";
                 ctx.beginPath(); ctx.arc(targetX, targetY, 7, 0, 2 * Math.PI); ctx.fill();
@@ -283,17 +295,19 @@ HTML_LAYOUT = """
         sse.onmessage = function(e) {
             const data = JSON.parse(e.data);
             curDist = data.distance; curPan = data.pan;
-            document.getElementById("lbl-distance").innerHTML = `${data.distance}<span>mm</span>`;
+            document.getElementById("lbl-distance").innerHTML = data.distance >= 8190 ? "MAX<span>mm</span>" : `${data.distance}<span>mm</span>`;
             document.getElementById("lbl-pan").innerText = `${data.pan}°`;
             document.getElementById("lbl-tilt").innerText = `${data.tilt}°`;
 
             const statusContainer = document.getElementById("lbl-status");
             if (data.is_alarm) {
-                statusContainer.innerText = "XÂM NHẬP!"; statusContainer.style.color = "#ff3333";
+                statusContainer.innerText = "XÂM NHẬP BIÊN!"; statusContainer.style.color = "#ff3333";
             } else if (data.status === "TRACKING") {
                 statusContainer.innerText = `BÁM: ${data.label.toUpperCase()}`; statusContainer.style.color = "#ffaa00";
+            } else if (data.status === "SCANNING") {
+                statusContainer.innerText = "PHÂN TÍCH AI..."; statusContainer.style.color = "#00ff66";
             } else {
-                statusContainer.innerText = "QUÉT TÌM KIẾM"; statusContainer.style.color = "#00f0ff";
+                statusContainer.innerText = "CHỜ MỤC TIÊU"; statusContainer.style.color = "#61879f";
             }
 
             if (data.log_msg && data.log_msg !== lastLogMsg) {
