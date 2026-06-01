@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['Helicopter', 'Jet', 'Rocket']
+
+roboflow:
+  workspace: test-zw34y
+  project: air-defense-system-o60us
+  version: 4
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/test-zw34y/air-defense-system-o60us/dataset/4
